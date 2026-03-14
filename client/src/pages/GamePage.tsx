@@ -8,7 +8,7 @@ import GameOver from "../components/GameOver";
 
 export default function GamePage() {
   const { roomCode } = useParams<{ roomCode: string }>();
-  const { playerId, gameState, error } = useGameStore();
+  const { playerId, gameState, error, connected } = useGameStore();
 
   useEffect(() => {
     if (roomCode) {
@@ -41,9 +41,15 @@ export default function GamePage() {
 
       <div className="flex-1 min-h-0">
         {gameState.status === "lobby" && <Lobby />}
-        {(gameState.status === "setup" || gameState.status === "playing") && <GameBoard />}
+        {gameState.status === "playing" && <GameBoard />}
         {gameState.status === "finished" && <GameOver />}
       </div>
+
+      {!connected && gameState && (
+        <div className="fixed top-12 left-1/2 -translate-x-1/2 bg-yellow-900 text-yellow-200 px-4 py-2 rounded-lg shadow-lg text-sm z-50 animate-pulse">
+          Reconnecting...
+        </div>
+      )}
 
       {error && (
         <div className="fixed bottom-4 right-4 bg-red-900 text-red-200 px-4 py-2 rounded-lg shadow-lg">

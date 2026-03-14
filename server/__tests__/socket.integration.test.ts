@@ -169,7 +169,7 @@ describe("multi-client game flow", () => {
     expect(state3.players.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("host starts game and all clients receive setup state", async () => {
+  it("host starts game and all clients receive playing state", async () => {
     const { roomCode } = await createGameViaRest();
     await joinGameViaRest(roomCode, "p1", "Alice");
     await joinGameViaRest(roomCode, "p2", "Bob");
@@ -197,12 +197,12 @@ describe("multi-client game flow", () => {
     // Wait for any in-flight broadcasts to settle
     await new Promise((r) => setTimeout(r, 100));
 
-    // Host starts game — all clients should get setup state
-    const waitForSetup = (c: ReturnType<typeof createClient>) =>
+    // Host starts game — all clients should get playing state (auto-distribution skips setup)
+    const waitForPlaying = (c: ReturnType<typeof createClient>) =>
       new Promise<GameState>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("Timeout waiting for setup state")), 2000);
+        const timer = setTimeout(() => reject(new Error("Timeout waiting for playing state")), 2000);
         const handler = (state: GameState) => {
-          if (state.status === "setup") {
+          if (state.status === "playing") {
             clearTimeout(timer);
             c.off("game_state_update", handler);
             resolve(state);
@@ -211,14 +211,15 @@ describe("multi-client game flow", () => {
         c.on("game_state_update", handler);
       });
 
-    const s2update = waitForSetup(c2);
-    const s3update = waitForSetup(c3);
+    const s2update = waitForPlaying(c2);
+    const s3update = waitForPlaying(c3);
 
     c1.emit("game_action", { type: "start_game", playerId: "p1" });
 
     const [state2, state3] = await Promise.all([s2update, s3update]);
-    expect(state2.status).toBe("setup");
-    expect(state3.status).toBe("setup");
+    expect(state2.status).toBe("playing");
+    expect(state3.status).toBe("playing");
+    expect(state2.currentPhase).toBe("reinforce");
   });
 
   it("invalid action returns error only to acting player", async () => {
@@ -281,6 +282,125 @@ describe("multi-client game flow", () => {
     expect(p2.cards).toEqual([]);
     // Card deck is hidden
     expect(state.cardDeck).toEqual([]);
+  });
+
+  it("action broadcasts updated state to all players", async () => {
+    const { roomCode } = await createGameViaRest();
+    await joinGameViaRest(roomCode, "p1", "Alice");
+    await joinGameViaRest(roomCode, "p2", "Bob");
+    await joinGameViaRest(roomCode, "p3", "Carol");
+
+    const c1 = createClient();
+    const c2 = createClient();
+    const c3 = createClient();
+
+    const connect = (c: ReturnType<typeof createClient>, pid: string) =>
+      new Promise<void>((resolve) => {
+        c.connect();
+        c.once("connect", () => {
+          c.emit("join_game", { roomCode, playerId: pid });
+          c.once("game_state_update", () => resolve());
+        });
+      });
+
+    await connect(c1, "p1");
+    await connect(c2, "p2");
+    await connect(c3, "p3");
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Start game — all should receive playing state
+    const waitForState = (c: ReturnType<typeof createClient>) =>
+      new Promise<GameState>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Timeout")), 2000);
+        const handler = (state: GameState) => {
+          if (state.status === "playing") {
+            clearTimeout(timer);
+            c.off("game_state_update", handler);
+            resolve(state);
+          }
+        };
+        c.on("game_state_update", handler);
+      });
+
+    const s1 = waitForState(c1);
+    const s2 = waitForState(c2);
+    const s3 = waitForState(c3);
+
+    c1.emit("game_action", { type: "start_game", playerId: "p1" });
+
+    const [state1, state2, state3] = await Promise.all([s1, s2, s3]);
+
+    // All should be playing with same turn number
+    expect(state1.status).toBe("playing");
+    expect(state2.status).toBe("playing");
+    expect(state3.status).toBe("playing");
+    expect(state1.turnNumber).toBe(state2.turnNumber);
+
+    // Now the current player places troops — others should receive update
+    const currentPlayerId = state1.turnOrder[state1.currentTurnIndex];
+    const currentClient = currentPlayerId === "p1" ? c1 : currentPlayerId === "p2" ? c2 : c3;
+    const otherClient = currentPlayerId === "p1" ? c2 : c1;
+
+    const otherUpdate = waitForEvent<GameState>(otherClient, "game_state_update");
+
+    // Find an owned territory for the current player
+    const ownedTerritory = Object.entries(state1.territories).find(
+      ([, t]) => t.owner === currentPlayerId,
+    );
+    if (ownedTerritory && state1.reinforcementsRemaining > 0) {
+      currentClient.emit("game_action", {
+        type: "place_troops",
+        playerId: currentPlayerId,
+        placements: [{ territoryId: ownedTerritory[0], count: 1 }],
+      });
+
+      const updatedState = await otherUpdate;
+      expect(updatedState.reinforcementsRemaining).toBe(state1.reinforcementsRemaining - 1);
+    }
+  });
+
+  it("player reconnects and receives current state", async () => {
+    const { roomCode } = await createGameViaRest();
+    await joinGameViaRest(roomCode, "p1", "Alice");
+    await joinGameViaRest(roomCode, "p2", "Bob");
+
+    const c1 = createClient();
+    const c2 = createClient();
+
+    const connect = (c: ReturnType<typeof createClient>, pid: string) =>
+      new Promise<void>((resolve) => {
+        c.connect();
+        c.once("connect", () => {
+          c.emit("join_game", { roomCode, playerId: pid });
+          c.once("game_state_update", () => resolve());
+        });
+      });
+
+    await connect(c1, "p1");
+    await connect(c2, "p2");
+
+    // p2 disconnects
+    const disconnectNotice = waitForEvent<{ playerId: string }>(c1, "player_disconnected");
+    c2.disconnect();
+    await disconnectNotice;
+
+    // p2 reconnects with a new socket
+    const c2b = createClient();
+    const reconnectState = waitForEvent<GameState>(c2b, "game_state_update");
+
+    c2b.connect();
+    c2b.once("connect", () => {
+      c2b.emit("join_game", { roomCode, playerId: "p2" });
+    });
+
+    const state = await reconnectState;
+    expect(state.roomCode).toBe(roomCode);
+    expect(state.players).toHaveLength(2);
+    // p2 should see their own data
+    const p2 = state.players.find((p) => p.id === "p2");
+    expect(p2).toBeDefined();
+    expect(p2!.name).toBe("Bob");
   });
 
   it("disconnect marks player as disconnected and notifies others", async () => {

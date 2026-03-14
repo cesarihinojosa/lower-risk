@@ -1,7 +1,7 @@
 import type { Server, Socket } from "socket.io";
 import type { GameAction, GameState } from "../../shared/types";
 import { applyAction } from "../game/engine";
-import { filterStateForPlayer } from "../game/state";
+import { filterStateForPlayer, getCurrentPlayerId } from "../game/state";
 import { saveGame, loadGameByRoomCode } from "../db";
 
 // In-memory game state cache for active games (room code → state)
@@ -14,6 +14,98 @@ interface SocketMeta {
   roomCode: string;
 }
 const socketMeta = new Map<string, SocketMeta>();
+
+// Per-game action locks to prevent concurrent state mutations
+const actionLocks = new Map<string, boolean>();
+
+// Turn timers per game
+const turnTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearTurnTimer(roomCode: string) {
+  const existing = turnTimers.get(roomCode);
+  if (existing) {
+    clearTimeout(existing);
+    turnTimers.delete(roomCode);
+  }
+}
+
+function startTurnTimer(io: Server, roomCode: string) {
+  clearTurnTimer(roomCode);
+  const state = gameCache.get(roomCode);
+  if (!state || state.status !== "playing" || !state.settings.turnTimerSeconds) return;
+
+  const timerMs = state.settings.turnTimerSeconds * 1000;
+  const turnNumberAtStart = state.turnNumber;
+  const phaseAtStart = state.currentPhase;
+
+  const timer = setTimeout(() => {
+    turnTimers.delete(roomCode);
+    const currentState = gameCache.get(roomCode);
+    if (!currentState || currentState.status !== "playing") return;
+    // Only auto-advance if we're still on the same turn and phase
+    if (currentState.turnNumber !== turnNumberAtStart || currentState.currentPhase !== phaseAtStart) return;
+
+    const playerId = getCurrentPlayerId(currentState);
+
+    // Auto-advance based on phase
+    let action: GameAction;
+    if (currentState.currentPhase === "reinforce") {
+      // If reinforcements remain, place them randomly then advance
+      if (currentState.reinforcementsRemaining > 0) {
+        const ownedTerritory = Object.entries(currentState.territories)
+          .find(([, t]) => t.owner === playerId);
+        if (ownedTerritory) {
+          const placeResult = applyAction(currentState, {
+            type: "place_troops",
+            playerId,
+            placements: [{ territoryId: ownedTerritory[0] as any, count: currentState.reinforcementsRemaining }],
+          });
+          if (placeResult.success) {
+            gameCache.set(roomCode, placeResult.state);
+            saveGame(placeResult.state);
+          }
+        }
+      }
+      action = { type: "done_reinforcing", playerId };
+    } else if (currentState.currentPhase === "attack") {
+      // Check for pending conquest troop movement
+      if (currentState.combatState && !currentState.combatState.resolved) {
+        const minTroops = currentState.combatState.attackerDice.length;
+        const moveResult = applyAction(currentState, {
+          type: "move_troops_after_conquest",
+          playerId,
+          troops: minTroops,
+        });
+        if (moveResult.success) {
+          gameCache.set(roomCode, moveResult.state);
+          saveGame(moveResult.state);
+        }
+      }
+      action = { type: "done_attacking", playerId };
+    } else {
+      action = { type: "skip_fortify", playerId };
+    }
+
+    const freshState = gameCache.get(roomCode);
+    if (!freshState) return;
+    const result = applyAction(freshState, action);
+    if (result.success) {
+      gameCache.set(roomCode, result.state);
+      saveGame(result.state);
+      broadcastState(io, roomCode);
+      // Start timer for next turn/phase
+      startTurnTimer(io, roomCode);
+    }
+  }, timerMs);
+
+  turnTimers.set(roomCode, timer);
+
+  // Broadcast timer start to clients
+  io.to(roomCode).emit("turn_timer", {
+    expiresAt: Date.now() + timerMs,
+    durationMs: timerMs,
+  });
+}
 
 export function getGameState(roomCode: string): GameState | undefined {
   let state: GameState | undefined = gameCache.get(roomCode);
@@ -87,24 +179,49 @@ export function registerSocketHandlers(io: Server) {
         return;
       }
 
-      const state = getGameState(meta.roomCode);
-      if (!state) {
-        socket.emit("action_error", { message: "Game not found" });
+      // Serialize actions per game to prevent race conditions
+      if (actionLocks.get(meta.roomCode)) {
+        socket.emit("action_error", { message: "Action in progress, try again" });
         return;
       }
+      actionLocks.set(meta.roomCode, true);
 
-      const result = applyAction(state, action);
-      if (!result.success) {
-        socket.emit("action_error", { message: result.error });
-        return;
+      try {
+        const state = getGameState(meta.roomCode);
+        if (!state) {
+          socket.emit("action_error", { message: "Game not found" });
+          return;
+        }
+
+        const result = applyAction(state, action);
+        if (!result.success) {
+          socket.emit("action_error", { message: result.error });
+          return;
+        }
+
+        // Update cache and persist
+        gameCache.set(meta.roomCode, result.state);
+        saveGame(result.state);
+
+        // If combat occurred, broadcast the result for animations
+        if (result.combatResult) {
+          io.to(meta.roomCode).emit("combat_result", result.combatResult);
+        }
+
+        // Broadcast new state to all players
+        broadcastState(io, meta.roomCode);
+
+        // Restart turn timer on phase/turn changes
+        if (result.state.status === "playing" && result.state.settings.turnTimerSeconds) {
+          startTurnTimer(io, meta.roomCode);
+        }
+        // Clear timer if game ended
+        if (result.state.status === "finished") {
+          clearTurnTimer(meta.roomCode);
+        }
+      } finally {
+        actionLocks.delete(meta.roomCode);
       }
-
-      // Update cache and persist
-      gameCache.set(meta.roomCode, result.state);
-      saveGame(result.state);
-
-      // Broadcast new state to all players
-      broadcastState(io, meta.roomCode);
     });
 
     socket.on("disconnect", () => {

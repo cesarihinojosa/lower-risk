@@ -4,6 +4,7 @@ Read `risk-game-spec.md` for the full technical specification.
 Follow the implementation phases defined in section 11.
 Use TypeScript for both client and server.
 Use the file/folder structure defined in section 12.
+Run tests after each change to ensure the system works as expected.
 
 ## Conventions
 - All game logic is server-authoritative

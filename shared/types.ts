@@ -22,6 +22,8 @@ export interface GameState {
   combatState: CombatState | null;
   log: GameLogEntry[];
   winner: string | null;
+  reinforcementsRemaining: number;  // troops left to place during reinforce phase
+  conqueredThisTurn: boolean;       // whether current player conquered a territory
 }
 
 export interface GameSettings {

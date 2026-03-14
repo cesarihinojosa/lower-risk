@@ -17,10 +17,14 @@ interface GameStore {
   playerName: string;
   gameState: GameState | null;
   error: string | null;
+  turnTimerExpiresAt: number | null;
+  connected: boolean;
 
   setPlayerName: (name: string) => void;
   setGameState: (state: GameState) => void;
   setError: (error: string | null) => void;
+  setTurnTimer: (expiresAt: number | null) => void;
+  setConnected: (connected: boolean) => void;
   clearGame: () => void;
 }
 
@@ -29,6 +33,8 @@ export const useGameStore = create<GameStore>((set) => ({
   playerName: localStorage.getItem("risk_player_name") || "",
   gameState: null,
   error: null,
+  turnTimerExpiresAt: null,
+  connected: false,
 
   setPlayerName: (name: string) => {
     localStorage.setItem("risk_player_name", name);
@@ -43,7 +49,15 @@ export const useGameStore = create<GameStore>((set) => ({
     set({ error });
   },
 
+  setTurnTimer: (expiresAt: number | null) => {
+    set({ turnTimerExpiresAt: expiresAt });
+  },
+
+  setConnected: (connected: boolean) => {
+    set({ connected });
+  },
+
   clearGame: () => {
-    set({ gameState: null, error: null });
+    set({ gameState: null, error: null, turnTimerExpiresAt: null });
   },
 }));
